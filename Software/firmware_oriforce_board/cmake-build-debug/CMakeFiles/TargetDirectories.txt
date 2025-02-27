@@ -1,0 +1,3 @@
+C:/Users/LiangGuang/OneDrive/Documents/PersonalProject/OriSense/Software/firmware_oriforce_board/cmake-build-debug/CMakeFiles/firmware_oriforce_board.elf.dir
+C:/Users/LiangGuang/OneDrive/Documents/PersonalProject/OriSense/Software/firmware_oriforce_board/cmake-build-debug/CMakeFiles/edit_cache.dir
+C:/Users/LiangGuang/OneDrive/Documents/PersonalProject/OriSense/Software/firmware_oriforce_board/cmake-build-debug/CMakeFiles/rebuild_cache.dir

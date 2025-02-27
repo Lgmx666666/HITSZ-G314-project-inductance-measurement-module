@@ -1,0 +1,15 @@
+../Drivers/STM32WBxx_HAL_Driver/Inc/stm32wbxx_ll_bus.h:364:22:LL_AHB1_GRP1_EnableClock	1
+../Drivers/STM32WBxx_HAL_Driver/Inc/stm32wbxx_ll_bus.h:539:22:LL_AHB2_GRP1_EnableClock	1
+../Core/Src/main.c:86:5:main	2
+../Core/Src/main.c:165:6:SystemClock_Config	3
+../Core/Src/main.c:209:6:PeriphCommonClock_Config	2
+../Core/Src/main.c:234:13:MX_I2C1_Init	4
+../Core/Src/main.c:282:13:MX_IPCC_Init	2
+../Core/Src/main.c:308:6:MX_LPUART1_UART_Init	5
+../Core/Src/main.c:356:13:MX_RF_Init	1
+../Core/Src/main.c:377:13:MX_RTC_Init	3
+../Core/Src/main.c:420:13:MX_TIM2_Init	4
+../Core/Src/main.c:463:13:MX_DMA_Init	1
+../Core/Src/main.c:482:13:MX_GPIO_Init	1
+../Core/Src/main.c:600:6:HAL_TIM_PeriodElapsedCallback	2
+../Core/Src/main.c:609:6:Error_Handler	1

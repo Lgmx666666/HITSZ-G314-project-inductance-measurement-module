@@ -1,0 +1,7 @@
+../Core/Src/ldc1614.c:12:6:ldc1614_writeWord	40	static
+../Core/Src/ldc1614.c:20:10:ldc1614_readWord	40	static
+../Core/Src/ldc1614.c:29:9:ldc1614_init	8	static
+../Core/Src/ldc1614.c:62:6:ldc1614_processDRDY	8	static
+../Core/Src/ldc1614.c:73:7:ldc1614_readFreqRatio	24	static
+../Core/Src/ldc1614.c:88:7:ldc1614_readFreq	24	static
+../Core/Src/ldc1614.c:103:7:ldc1614_readInductance	32	static

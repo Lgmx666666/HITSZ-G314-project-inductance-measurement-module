@@ -1,0 +1,10 @@
+July 26, 2018
+
+There are two Spreadsheet calculator tools included in this zip file. 
+
+The first, LDC_Tools-ext51.xls, is a general purpose calculator tool with several tabs, where each tab is dedicated to a different LDC sensing device or functionality. Instructions on the use of the main tabs are included in the file.
+
+The Excel_FEMM_v1p29.xslm is a modified version of the Spiral Inductor Designer Tab in LDC_Tools-ext51.xls. This version uses VB macros to construct a Finite Element Magnetics simulation of the sensor and target designed. This calculator tool can provide more accurate results for a broader range of configurations than the normal version can address. Use of this calculator requires the installation of FEMM, which is available at http://www.fenn.info   
+ 
+These tools are provided only as a convenience for Inductive Sensing system design, and do not have any warranty. Users should independently verify any and all results.    
+

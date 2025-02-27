@@ -1,0 +1,6 @@
+../STM32_WPAN/App/hrs_app.c:82:6:HRS_Notification	5
+../STM32_WPAN/App/hrs_app.c:138:6:HRSAPP_Init	4
+../STM32_WPAN/App/hrs_app.c:185:13:HRSAPP_Measurement	4
+../STM32_WPAN/App/hrs_app.c:220:13:HrMeas	1
+../STM32_WPAN/App/hrs_app.c:235:17:HRSAPP_Read_RTC_SSR_SS	1
+../STM32_WPAN/App/hrs_app.c:241:10:encode_floats	1

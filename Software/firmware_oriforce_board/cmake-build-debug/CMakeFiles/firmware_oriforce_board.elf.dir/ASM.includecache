@@ -1,0 +1,10 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+C:/Users/LiangGuang/OneDrive/Documents/PersonalProject/OriSense/Software/firmware_oriforce_board/Core/Startup/startup_stm32g031g8ux.s
+

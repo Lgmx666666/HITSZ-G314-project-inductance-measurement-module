@@ -1,0 +1,863 @@
+
+//#include <intrinsics.h>
+#include <stdint.h>
+#include <string.h>
+//#include <cstring>
+#include <stdio.h>
+
+#include "spi_1p1.h"
+#include "crc8.h"
+
+#include "LDC1000_cmd.h"
+#include "LDC1000_evm.h"
+#include "host_legacy.h"
+#include "host_interface.h"
+#include "host_menu.h"
+#include "scheduler.h"
+
+#include "HAL_FLASH.h"
+
+#include "USB_API/USB_Common/device.h"
+#include "USB_API/USB_Common/types.h"               //Basic Type declarations
+#include "USB_API/USB_Common/usb.h"                 //USB-specific functions
+
+#include "USB_API/USB_CDC_API/UsbCdc.h"
+#include "usbConstructs.h"
+#include "USB_config/descriptors.h"
+
+#define HOST_INTERFACE_MAX_STREAM_TASKS 5
+
+#define HOST_STREAM_TICKS_MIN   10
+#define HOST_STREAM_TICKS_MAX   0xFFFF
+#define HOST_STREAM_TICKS_INC   10
+
+#define INFOC_START   (0x1880)
+
+// flash memory
+#pragma DATA_SECTION(FlashSerial, ".infoC")
+uint8_t  FlashSerial[HOST_SERIAL_LENGTH];
+
+// this shared secret is randomly generated, do not change
+// ^q,}pt#>(bv5#3#xs(r4yfo(a<s(cn
+static const uint8_t sharedSecret[30] = {
+		'^','q',',','}','p','t','#','>',
+		'(','b','v','5','#','3','#','x',
+		's','(','r','4','y','f','o','(',
+		'a','<','s','(','c','n'
+};
+
+const uint8_t HOST_CONTROLLER_TYPE[] = {'L','D','C','1','0','0','0','E','V','M','\0'};
+const uint8_t HOST_FIRMWARE_VERSION[] = {Firmware_VersionA,Firmware_VersionB,Firmware_VersionC,Firmware_VersionD};
+const uint8_t HOST_CMD_STREAM_WHITELIST[] = {
+		HOST_CMD_CONTROLLER_TYPE,
+		HOST_CMD_FIRMWARE_VERSION,
+		HOST_CMD_ENUMERATE_DEVICES,
+		HOST_CMD_SPI_READ_BYTES,
+		HOST_CMD_READ_ALL_DATA,
+		HOST_CMD_SET_LED_STATES
+};
+
+// for USB
+extern uint8_t bCDCDataReceived_event;
+
+// for timing (scheduler)
+extern volatile uint16_t timer_ticks;
+
+// host device variables
+static uint8_t host_devices[HOST_NUM_DEVICES + 1] = { HOST_NUM_DEVICES, HOST_DEVICE_LDC1000 };
+static uint8_t default_addr;
+static uint8_t default_dev = 1;
+
+// menu prototypes
+static void menuReadProx();
+static void menuReadFreq();
+static void menuStartStream();
+static void menuStopStream();
+static void menuDecreasePeriod();
+static void menuIncreasePeriod();
+static void menuCycleLEDS();
+static void menuCycleRpMin();
+static void menuCycleRpMax();
+
+// string menu variables
+static host_menu_item_t menu_items[] = {
+		{'1',"proximity",&menuReadProx,NULL},
+		{'2',"freq count",&menuReadFreq,NULL},
+		{'3',"start stream",&menuStartStream,NULL},
+		{'4',"stop stream",&menuStopStream,NULL},
+		{'5',"stream period-",&menuDecreasePeriod,NULL},
+		{'6',"stream period+",&menuIncreasePeriod,NULL},
+		{'7',"cycle LEDs",&menuCycleLEDS,NULL},
+		{'8',"cycle RpMin",&menuCycleRpMin,NULL},
+		{'9',"cycle RpMax",&menuCycleRpMax,NULL}
+};
+#define HOST_INTERFACE_MENU_ITEMS (sizeof(menu_items)/sizeof(host_menu_item_t))
+
+static enum {
+		NORMAL = 0,
+		ASCII
+} packet_stream_type;
+
+// streaming packet variables
+//static uint8_t packet_stream_lock;
+//static host_stream_start_data_t * packet_stream_data;
+
+// tasks
+static host_task_data_t packet_tasks[HOST_INTERFACE_MAX_STREAM_TASKS];
+
+// prototypes
+void taskStreamExecute(scheduled_task_t * self);
+
+static void taskStopAll() {
+	uint8_t i;
+	for (i = 0; i < HOST_INTERFACE_MAX_STREAM_TASKS; i++) {
+		if (packet_tasks[i].task.active == TRUE) {
+			removeTask(&packet_tasks[i].task);
+		}
+	}
+}
+static uint8_t getTaskIndexFromPID(uint8_t pid) {
+	uint8_t i;
+	for (i = 0; i < HOST_INTERFACE_MAX_STREAM_TASKS; i++) {
+		if (packet_tasks[i].task.pid == pid) {
+			return i;
+		}
+	}
+	return i;
+}
+static uint8_t getTaskIndexIdle() {
+	uint8_t i;
+	for (i = 0; i < HOST_INTERFACE_MAX_STREAM_TASKS; i++) {
+		if (packet_tasks[i].task.active == FALSE) {
+			return i;
+		}
+	}
+	return i;
+}
+
+static void menuReadProx() {
+	uint8_t i;
+	uint16_t data;
+	uint8_t printString[16];
+	if (!spi_readBytes(NULL, LDC1000_CMD_PROXLSB, &printString[0], 2)) {
+		i = sprintf ((char *)printString,"err timeout\r\n");
+	}
+	else {
+		data = printString[0] | (printString[1] << 8);
+		i = sprintf ((char *)printString,"0x%x\r\n",data);
+	}
+	sendString((char *)printString,i);
+}
+static void menuReadFreq() {
+	uint8_t i;
+	uint32_t data;
+	uint8_t printString[16];
+	// initiate conversion
+	if (!spi_readBytes(NULL, LDC1000_CMD_PROXLSB, &printString[0], 5)) {
+		i = sprintf ((char *)printString,"err timeout\r\n");
+	}
+	else {
+		data = printString[2] | (printString[3] << 8) | (printString[4] << 16);
+		i = sprintf ((char *)printString,"0x%x\r\n",data);
+	}
+	sendString((char *)printString,i);
+}
+void menuReadAll(scheduled_task_t * self) {
+	uint8_t i;
+	uint16_t prox;
+	uint32_t freq;
+	uint8_t printString[16];
+	if (packet_stream_type == ASCII) {
+		// initiate conversion
+		if (!spi_readBytes(NULL, LDC1000_CMD_PROXLSB, &printString[0], 5)) {
+			i = sprintf ((char *)printString,"err timeout\r\n");
+		}
+		else {
+			prox = printString[0] | (printString[1] << 8);
+			freq = printString[2] | (printString[3] << 8) | (printString[4] << 16);
+			i = sprintf ((char *)printString,"0x%x,0x%x\r\n",prox,freq);
+		}
+		sendString((char *)printString,i);
+	}
+}
+static void menuStartStream() {
+	uint8_t x;
+	char printString[16];
+	// grab data from datastream & output; start process
+	packet_stream_type = ASCII;
+	x = getTaskIndexFromPID(HOST_PID_MENU_READ_ALL);
+	if (x >= HOST_INTERFACE_MAX_STREAM_TASKS) {
+		// check to see if any stream is idle
+		x = getTaskIndexIdle();
+		if (x >= HOST_INTERFACE_MAX_STREAM_TASKS) {
+			// stop all streams
+			taskStopAll();
+			x = 0;
+		}
+	}
+	else {
+		// remove existing task
+		removeTask(&packet_tasks[x].task);
+	}
+	packet_tasks[x].task.ticks = 1000;
+	packet_tasks[x].task.pid = HOST_PID_MENU_READ_ALL;
+	packet_tasks[x].task.function = &menuReadAll;
+	addTask(&packet_tasks[x].task);
+	x = sprintf ((char *)printString,"stream start\r\n");
+	sendString((char *)printString,x);
+}
+static void menuStopStream() {
+	uint8_t x;
+	char printString[16];
+	x = getTaskIndexFromPID(HOST_PID_MENU_READ_ALL);
+	if (x < HOST_INTERFACE_MAX_STREAM_TASKS) {
+		removeTask(&packet_tasks[x].task);
+	}
+	x = sprintf ((char *)printString,"stream stop\r\n");
+	sendString((char *)printString,x);
+}
+static void menuDecreasePeriod() {
+	uint8_t x;
+	char printString[16];
+	x = getTaskIndexFromPID(HOST_PID_MENU_READ_ALL);
+	// task does not exist
+	if (x >= HOST_INTERFACE_MAX_STREAM_TASKS) {
+		x = sprintf ((char *)printString,"no stream\r\n");
+	}
+	else {
+		if (packet_tasks[x].task.ticks > (HOST_STREAM_TICKS_MIN + HOST_STREAM_TICKS_INC)) {
+			packet_tasks[x].task.ticks -= HOST_STREAM_TICKS_INC;
+		}
+		x = sprintf ((char *)printString,"%d ms\r\n",packet_tasks[x].task.ticks);
+	}
+	sendString((char *)printString,x);
+}
+static void menuIncreasePeriod() {
+	uint8_t x;
+	char printString[16];
+	x = getTaskIndexFromPID(HOST_PID_MENU_READ_ALL);
+	// task does not exist
+	if (x >= HOST_INTERFACE_MAX_STREAM_TASKS) {
+		x = sprintf ((char *)printString,"no stream\r\n");
+	}
+	else {
+		if (packet_tasks[x].task.ticks < (HOST_STREAM_TICKS_MAX-10)) {
+			packet_tasks[x].task.ticks += HOST_STREAM_TICKS_INC;
+		}
+		x = sprintf ((char *)printString,"%d ms\r\n",packet_tasks[x].task.ticks);
+	}
+	sendString((char *)printString,x);
+}
+static void menuCycleLEDS() {
+	uint8_t x;
+	char printString[8];
+	x = evm_LED_Set(CYCLE);
+	x = sprintf ((char *)printString,"0x%x\r\n",x);
+	sendString((char *)printString,x);
+}
+static void menuCycleRpMin() {
+	uint8_t i, x;
+	char printString[16];
+	// initiate conversion
+	if (!spi_readByte(NULL, LDC1000_CMD_RPMIN, &x)) {
+		i = sprintf ((char *)printString,"err read\r\n");
+	}
+	else {
+		x--;
+		if (!spi_writeByte(NULL, LDC1000_CMD_RPMIN, x)) {
+			i = sprintf ((char *)printString,"err write\r\n");
+		}
+		else {
+			i = sprintf ((char *)printString,"0x%x\r\n",x);
+		}
+	}
+	sendString((char *)printString,i);
+}
+static void menuCycleRpMax() {
+	uint8_t i, x;
+	char printString[16];
+	// initiate conversion
+	if (!spi_readByte(NULL, LDC1000_CMD_RPMAX, &x)) {
+		i = sprintf ((char *)printString,"err read\r\n");
+	}
+	else {
+		x++;
+		if (!spi_writeByte(NULL, LDC1000_CMD_RPMAX, x)) {
+			i = sprintf ((char *)printString,"err write\r\n");
+		}
+		else {
+			i = sprintf ((char *)printString,"0x%x\r\n",x);
+		}
+	}
+	sendString((char *)printString,i);
+}
+
+static void readSerialFromFlash() {
+	uint8_t i;
+	// import serial
+	for (i = 0; i < HOST_SERIAL_LENGTH; i++) {
+		serial[i] = FlashSerial[i];
+	}
+	// validate crc
+	if (calcCRC8((uint8_t *) &serial[0], HOST_SERIAL_LENGTH)) {
+		memset(&serial[0],0xFF,HOST_SERIAL_LENGTH);
+	}
+}
+
+void initHostInterface() {
+	uint8_t i;
+//	default_dev = 1;
+	// read serial data
+	readSerialFromFlash();
+	// TODO: scan for attached devices, add commands based on devices found
+	packet_stream_type = NORMAL;
+	initMenuItems();
+	for (i = 0; i < HOST_INTERFACE_MENU_ITEMS; i++) {
+		addMenuItem(&menu_items[i]);
+	}
+	// reset packet_tasks
+	for (i = 0; i < HOST_INTERFACE_MAX_STREAM_TASKS; i++) {
+		packet_tasks[i].task.timedout = FALSE;
+		packet_tasks[i].task.active = FALSE;
+	}
+	initScheduler();
+}
+
+static void sendPacket (host_cmd_packet_t *packet, uint8_t size) {
+//	static WORD i;
+	packet->fields.crc = calcCRC8((uint8_t *)packet, size-HOST_CRC_SIZE);
+	packet->bytes[size-HOST_CRC_SIZE] = packet->fields.crc;
+//    if (cdcSendDataInBackground((BYTE*)packet,(WORD)size,CDC0_INTFNUM,0))
+    if (cdcSendDataInBackground((BYTE*)packet,(WORD)HOST_MAX_REPLY_PACKET_LENGTH,CDC0_INTFNUM,0))
+    {      //Send it
+//        USBCDC_abortSend((WORD*)&i,CDC0_INTFNUM);              //Operation probably still open; cancel it
+    	_nop();
+    }
+}
+static void sendErrorPacket (host_cmd_packet_t *packet, ERROR_CODE error_code) {
+	packet->fields.hdr.length = 0;
+	packet->fields.hdr.err_code = (int8_t) error_code;
+	sendPacket(packet,HOST_ERR_PACKET_LENGTH);
+}
+
+static void executeCmdPacket (host_cmd_packet_t * responsePkt) {
+	static uint16_t x;
+	// Load the Reply Packet Header
+//    	responsePkt->fields.hdr.id = HOST_ID;
+//    	responsePkt->fields.hdr.command_code = commandPkt->fields.hdr.command_code;
+//    	responsePkt->fields.hdr.device_num = commandPkt->fields.hdr.device_num;
+//    	responsePkt->fields.hdr.err_code = (uint8_t)ERR_OK;
+
+	switch (responsePkt->fields.hdr.command_code)
+	{
+		case HOST_CMD_CONTROLLER_TYPE:
+			// copy from const data
+			memcpy(&(responsePkt->fields.data[0]),&HOST_CONTROLLER_TYPE[0],HOST_CONTROLLER_TYPE_LENGTH);
+			responsePkt->fields.hdr.length = HOST_CONTROLLER_TYPE_LENGTH;
+			sendPacket(responsePkt,HOST_OUT_HDR_SIZE + HOST_CONTROLLER_TYPE_LENGTH + HOST_CRC_SIZE);
+			break;
+		case HOST_CMD_FIRMWARE_VERSION:
+			// copy from const data
+			memcpy(&(responsePkt->fields.data[0]),&HOST_FIRMWARE_VERSION[0],HOST_FIRMWARE_VERSION_LENGTH);
+			responsePkt->fields.hdr.length = HOST_FIRMWARE_VERSION_LENGTH;
+			sendPacket(responsePkt,HOST_OUT_HDR_SIZE + HOST_FIRMWARE_VERSION_LENGTH + HOST_CRC_SIZE);
+			break;
+		case HOST_CMD_ENUMERATE_DEVICES:
+			// copy from const data
+			memcpy(&(responsePkt->fields.data[0]),&host_devices[0],host_devices[0] + 1);
+			responsePkt->fields.hdr.length = host_devices[0] + 1;
+			sendPacket(responsePkt,HOST_OUT_HDR_SIZE + host_devices[0] + 1 + HOST_CRC_SIZE);
+			break;
+		/*case HOST_CMD_SET_DEFAULT_DEVICE:*/
+			// Set the default device
+			// only one device so command not available
+			/*break;*/
+//		case HOST_CMD_I2C_SETUP:
+//			// validate length and pec
+//			if (responsePkt->fields.hdr.length != 4) {
+//				sendErrorPacket(responsePkt,ERR_BAD_PACKET_SIZE);
+//				break;
+//			}
+//			else if (responsePkt->fields.data[3] != 0) {
+//				sendErrorPacket(responsePkt,ERR_PARAM_OUT_OF_RANGE);
+//				break;
+//			}
+//			x = (responsePkt->fields.data[2] << 8) | responsePkt->fields.data[1];
+//			// set the clock (kills any previous read/write)
+//			i2c_setClock((i2c_clock_t) (responsePkt->fields.data[0] & I2C_CLK_MASK), x);
+//			sendPacket(responsePkt,HOST_OUT_HDR_SIZE + responsePkt->fields.hdr.length + HOST_CRC_SIZE);
+//			break;
+//		case HOST_CMD_SMBUS_READ_BYTES:
+//			// validate length
+//			if (responsePkt->fields.hdr.length != 3) {
+//				sendErrorPacket(responsePkt,ERR_BAD_PACKET_SIZE);
+//				break;
+//			}
+//			x = responsePkt->fields.data[2];
+//			// read bytes
+//			if (!smbus_readBytes(responsePkt->fields.data[0], &(responsePkt->fields.data[1]), x)) {
+//				sendErrorPacket(responsePkt,ERR_I2C_READ_TIMEOUT);
+//				break;
+//			}
+//			else {
+//				responsePkt->fields.hdr.length = x + 2;
+//				sendPacket(responsePkt,HOST_OUT_HDR_SIZE + responsePkt->fields.hdr.length + HOST_CRC_SIZE);
+//			}
+//			break;
+//		case HOST_CMD_SMBUS_WRITE_BYTES:
+//			// validate length
+//			if (responsePkt->fields.hdr.length < 2) {
+//				sendErrorPacket(responsePkt,ERR_BAD_PACKET_SIZE);
+//				break;
+//			}
+//			x = responsePkt->fields.hdr.length - 1;
+//			// write bytes
+//			if (!i2c_writeBytes(responsePkt->fields.data[0], &(responsePkt->fields.data[1]), x)) {
+//				sendErrorPacket(responsePkt,ERR_I2C_WRITE_TIMEOUT);
+//				break;
+//			}
+//			else {
+//				sendPacket(responsePkt,HOST_OUT_HDR_SIZE + responsePkt->fields.hdr.length + HOST_CRC_SIZE);
+//			}
+//			break;
+//		case HOST_CMD_I2C_READ_BYTES:
+//			// validate length
+//			if (responsePkt->fields.hdr.length != 2) {
+//				sendErrorPacket(responsePkt,ERR_BAD_PACKET_SIZE);
+//				break;
+//			}
+//			x = responsePkt->fields.data[1];
+//			// read bytes
+//			if (!i2c_readBytes(responsePkt->fields.data[0], &(responsePkt->fields.data[1]), x)) {
+//				sendErrorPacket(responsePkt,ERR_I2C_READ_TIMEOUT);
+//				break;
+//			}
+//			else {
+//				responsePkt->fields.hdr.length = x + 1;
+//				sendPacket(responsePkt,HOST_OUT_HDR_SIZE + responsePkt->fields.hdr.length + HOST_CRC_SIZE);
+//			}
+//			break;
+//		case HOST_CMD_I2C_WRITE_BYTES:
+//			// validate length
+//			if (responsePkt->fields.hdr.length == 0) {
+//				sendErrorPacket(responsePkt,ERR_BAD_PACKET_SIZE);
+//				break;
+//			}
+//			x = responsePkt->fields.hdr.length - 1;
+//			// write bytes
+//			if (!i2c_writeBytes(responsePkt->fields.data[0], &(responsePkt->fields.data[1]), x)) {
+//				sendErrorPacket(responsePkt,ERR_I2C_WRITE_TIMEOUT);
+//				break;
+//			}
+//			else {
+//				sendPacket(responsePkt,HOST_OUT_HDR_SIZE + responsePkt->fields.hdr.length + HOST_CRC_SIZE);
+//			}
+//			break;
+		case HOST_CMD_START_STREAM: {
+			host_stream_start_packet_t * startPkt = (host_stream_start_packet_t *) responsePkt;
+			// validate if command code is supported
+			for (x = 0; x < sizeof(HOST_CMD_STREAM_WHITELIST); x++) {
+				if (startPkt->fields.data.command_code == HOST_CMD_STREAM_WHITELIST[x]) {
+					break;
+				}
+			}
+			if (x >= sizeof(HOST_CMD_STREAM_WHITELIST)) {
+				// command code not supported for streaming
+				sendErrorPacket(responsePkt,ERR_PARAM_OUT_OF_RANGE);
+				break;
+			}
+			x = getTaskIndexFromPID(startPkt->fields.data.pid);
+			if (x >= HOST_INTERFACE_MAX_STREAM_TASKS) {
+				// task not found; get idle index
+				x = getTaskIndexIdle();
+				// no tasks are idle; maximum tasks alloted
+				if (x >= HOST_INTERFACE_MAX_STREAM_TASKS) {
+					sendErrorPacket(responsePkt,ERR_PARAM_OUT_OF_RANGE);
+					break;
+				}
+			}
+			else {
+				// remove existing task
+				removeTask(&packet_tasks[x].task);
+			}
+			packet_stream_type = NORMAL;
+			// setup packet
+			memcpy(&packet_tasks[x].packet,startPkt,HOST_STREAM_IN_PACKET_LENGTH);
+			packet_tasks[x].packet.fields.hdr.command_code = startPkt->fields.data.command_code;
+			packet_tasks[x].packet.fields.hdr.length -= HOST_STREAM_IN_EHDR_LEN;
+			// setup data
+			if (packet_tasks[x].packet.fields.hdr.length) {
+				memcpy(&packet_tasks[x].packet.fields.data,&startPkt->fields.data.bytes[0],packet_tasks[x].packet.fields.hdr.length);
+			}
+			// setup task
+			// set PID
+			packet_tasks[x].task.pid = startPkt->fields.data.pid;
+			// set ticks
+			packet_tasks[x].task.ticks = (startPkt->fields.data.interval_divider_hi << 8) |
+					startPkt->fields.data.interval_divider_lo;
+			// set task function
+			packet_tasks[x].task.function = &taskStreamExecute;
+			// start task
+			addTask(&packet_tasks[x].task);
+			}
+		    sendPacket(responsePkt,HOST_OUT_HDR_SIZE + responsePkt->fields.hdr.length + HOST_CRC_SIZE);
+			break;
+		case HOST_CMD_STOP_STREAM:
+			// validate length
+			if (responsePkt->fields.hdr.length != 1) {
+				sendErrorPacket(responsePkt,ERR_BAD_PACKET_SIZE);
+				break;
+			}
+			x = getTaskIndexFromPID(responsePkt->fields.data[0]);
+			if (x >= HOST_INTERFACE_MAX_STREAM_TASKS) {
+				sendErrorPacket(responsePkt,ERR_PARAM_OUT_OF_RANGE);
+				break;
+			}
+			else {
+				removeTask(&packet_tasks[x].task);
+				sendPacket(responsePkt,HOST_OUT_HDR_SIZE + responsePkt->fields.hdr.length + HOST_CRC_SIZE);
+			}
+			break;
+		case HOST_CMD_STOP_ALL_STREAMS:
+			taskStopAll();
+			sendPacket(responsePkt,HOST_OUT_HDR_SIZE + responsePkt->fields.hdr.length + HOST_CRC_SIZE);
+			break;
+		case HOST_CMD_READ_SERIAL:
+			memcpy(&(responsePkt->fields.data[0]),&serial[0],HOST_SERIAL_LENGTH);
+			responsePkt->fields.hdr.length = HOST_SERIAL_LENGTH;
+			sendPacket(responsePkt,HOST_OUT_HDR_SIZE + HOST_SERIAL_LENGTH + HOST_CRC_SIZE);
+			break;
+		case HOST_CMD_WRITE_SERIAL:
+			if (responsePkt->fields.hdr.length != HOST_SERIAL_LENGTH) {
+				sendErrorPacket(responsePkt,ERR_BAD_PACKET_SIZE);
+				break;
+			}
+			// validate crc
+			for (x = 0; x < HOST_SERIAL_LENGTH; x++) {
+				serial[x] = responsePkt->fields.data[x] ^ sharedSecret[x];
+			}
+			if (calcCRC8((uint8_t *) &serial[0], HOST_SERIAL_LENGTH)) {
+				// restore serial
+				readSerialFromFlash();
+				sendErrorPacket(responsePkt,ERR_PARAM_OUT_OF_RANGE);
+				break;
+			}
+			sendPacket(responsePkt,HOST_OUT_HDR_SIZE + HOST_SERIAL_LENGTH + HOST_CRC_SIZE);
+			break;
+		case HOST_CMD_ENTER_BSL:
+			taskStopAll();
+			USB_reset ();
+			USB_disable();
+			_disable_interrupts();
+			((void (*)())0x1000)();
+			break;
+		// LDC1000-specific cases
+		case HOST_CMD_READ_ALL_DATA: {
+			uint8_t j;
+			// validate length
+			if (responsePkt->fields.hdr.length != 1) {
+				sendErrorPacket(responsePkt,ERR_BAD_PACKET_SIZE);
+				break;
+			}
+			j = (responsePkt->fields.hdr.device_num - 1) * HOST_OFFSETS_SIZE;
+			// initiate conversion
+			if (!i2c_writeByte(responsePkt->fields.data[0], HDC1000_CMD_TEMP)) {
+				sendErrorPacket(responsePkt,ERR_I2C_READ_TIMEOUT);
+				break;
+			}
+			// timeout at 15ms
+			x = timer_ticks + 15;
+			while ((timer_ticks != x) && EVM_DRDYN_HI()) {};
+			// read data
+			if (!i2c_readBytes(responsePkt->fields.data[0], &(responsePkt->fields.data[1]), 2)) {
+				sendErrorPacket(responsePkt,ERR_I2C_READ_TIMEOUT);
+				break;
+			}
+			// subtract offset
+			x = (responsePkt->fields.data[1] << 8) | responsePkt->fields.data[2];
+			if (offsets[j + HOST_OFFSETS_TEMP] >= x) {
+				x = 0;
+			}
+			else {
+				x -= offsets[j + HOST_OFFSETS_TEMP];
+			}
+			responsePkt->fields.data[1] = (x >> 8) & 0xFF;
+			responsePkt->fields.data[2] = x & 0xFF;
+			// initiate conversion
+			if (!i2c_writeByte(responsePkt->fields.data[0], HDC1000_CMD_HUMIDITY)) {
+				sendErrorPacket(responsePkt,ERR_I2C_READ_TIMEOUT);
+				break;
+			}
+			// timeout at 15ms
+			x = timer_ticks + 15;
+			while ((timer_ticks != x) && EVM_DRDYN_HI()) {};
+			// read data
+			if (!i2c_readBytes(responsePkt->fields.data[0], &(responsePkt->fields.data[3]), 2)) {
+				sendErrorPacket(responsePkt,ERR_I2C_READ_TIMEOUT);
+				break;
+			}
+			// subtract offset
+			x = (responsePkt->fields.data[3] << 8) | responsePkt->fields.data[4];
+			if (offsets[j + HOST_OFFSETS_HUMIDITY] >= x) {
+				x = 0;
+			}
+			else {
+				x -= offsets[j + HOST_OFFSETS_HUMIDITY];
+			}
+			responsePkt->fields.data[3] = (x >> 8) & 0xFF;
+			responsePkt->fields.data[4] = x & 0xFF;
+			responsePkt->fields.hdr.length = 5;
+			sendPacket(responsePkt,HOST_OUT_HDR_SIZE + responsePkt->fields.hdr.length + HOST_CRC_SIZE);
+			break;
+		}
+		case HOST_CMD_SET_LED_STATES:
+			// read
+			if (responsePkt->fields.hdr.length == 0) {
+				responsePkt->fields.data[0] = evm_LED_State();
+				responsePkt->fields.hdr.length = 1;
+				sendPacket(responsePkt,HOST_OUT_HDR_SIZE + responsePkt->fields.hdr.length + HOST_CRC_SIZE);
+				break;
+			}
+			// validate length
+			else if (responsePkt->fields.hdr.length != 1) {
+				sendErrorPacket(responsePkt,ERR_BAD_PACKET_SIZE);
+				break;
+			}
+			evm_LED_Set ((evm_led_state_t) (responsePkt->fields.data[0]));
+			sendPacket(responsePkt,HOST_OUT_HDR_SIZE + responsePkt->fields.hdr.length + HOST_CRC_SIZE);
+			break;
+		case HOST_CMD_DRDY_READ: {
+			uint8_t j;
+			// validate length
+			if (responsePkt->fields.hdr.length != 3) {
+				sendErrorPacket(responsePkt,ERR_BAD_PACKET_SIZE);
+				break;
+			}
+			x = responsePkt->fields.data[1];
+			// validate command code; we need this due to offsets
+			if (x == HDC1000_CMD_TEMP) {
+				j = (responsePkt->fields.hdr.device_num-1) * HOST_OFFSETS_SIZE + HOST_OFFSETS_TEMP;
+			}
+			else if (x == HDC1000_CMD_HUMIDITY) {
+				j = (responsePkt->fields.hdr.device_num-1) * HOST_OFFSETS_SIZE + HOST_OFFSETS_HUMIDITY;
+			}
+			else {
+				sendErrorPacket(responsePkt,ERR_PARAM_OUT_OF_RANGE);
+				break;
+			}
+			// initiate conversion
+			if (!i2c_writeByte(responsePkt->fields.data[0], x)) {
+				sendErrorPacket(responsePkt,ERR_I2C_READ_TIMEOUT);
+				break;
+			}
+			// timeout at 15ms
+			x = timer_ticks + 15;
+			while ((timer_ticks != x) && EVM_DRDYN_HI()) {};
+			// read length
+			x = responsePkt->fields.data[2];
+			// read data
+			if (!i2c_readBytes(responsePkt->fields.data[0], &(responsePkt->fields.data[2]), x)) {
+				sendErrorPacket(responsePkt,ERR_I2C_READ_TIMEOUT);
+				break;
+			}
+			responsePkt->fields.hdr.length = x + 2;
+			// subtract offset
+			x = (responsePkt->fields.data[2] << 8) | responsePkt->fields.data[3];
+			if (offsets[j] >= x) {
+				x = 0;
+			}
+			else {
+				x -= offsets[j];
+			}
+			responsePkt->fields.data[2] = (x >> 8) & 0xFF;
+			responsePkt->fields.data[3] = x & 0xFF;
+			sendPacket(responsePkt,HOST_OUT_HDR_SIZE + responsePkt->fields.hdr.length + HOST_CRC_SIZE);
+			break;
+		}
+		case HOST_CMD_SET_OFFSETS: {
+			uint8_t j;
+			j = (responsePkt->fields.hdr.device_num-1) * HOST_OFFSETS_SIZE;
+			// read
+			if (responsePkt->fields.hdr.length == 0) {
+				x = offsets[j + HOST_OFFSETS_TEMP];
+				responsePkt->fields.data[0] = (x >> 8) & 0xFF;
+				responsePkt->fields.data[1] = (x & 0xFF);
+				x = offsets[j + HOST_OFFSETS_HUMIDITY];
+				responsePkt->fields.data[2] = (x >> 8) & 0xFF;
+				responsePkt->fields.data[3] = (x & 0xFF);
+				responsePkt->fields.hdr.length = 4;
+				sendPacket(responsePkt,HOST_OUT_HDR_SIZE + responsePkt->fields.hdr.length + HOST_CRC_SIZE);
+				break;
+			}
+			// validate length
+			else if (responsePkt->fields.hdr.length != 4) {
+				sendErrorPacket(responsePkt,ERR_BAD_PACKET_SIZE);
+				break;
+			}
+			// save to RAM
+			x = (responsePkt->fields.data[0] << 8) | responsePkt->fields.data[1];
+			offsets[j + HOST_OFFSETS_TEMP] = x;
+			x = (responsePkt->fields.data[2] << 8) | responsePkt->fields.data[3];
+			offsets[j + HOST_OFFSETS_HUMIDITY] = x;
+			sendPacket(responsePkt,HOST_OUT_HDR_SIZE + responsePkt->fields.hdr.length + HOST_CRC_SIZE);
+			break;
+		}
+		case HOST_CMD_SET_CONFIG_DEFAULT:
+			// read
+			if (responsePkt->fields.hdr.length == 0) {
+				x = evm_read_config_defaults();
+				responsePkt->fields.data[0] = (x >> 8) & 0xFF;
+				responsePkt->fields.data[1] = (x & 0xFF);
+				responsePkt->fields.hdr.length = 2;
+				sendPacket(responsePkt,HOST_OUT_HDR_SIZE + responsePkt->fields.hdr.length + HOST_CRC_SIZE);
+				break;
+			}
+			// validate length
+			if (responsePkt->fields.hdr.length != 2) {
+				sendErrorPacket(responsePkt,ERR_BAD_PACKET_SIZE);
+				break;
+			}
+			// Big Endian
+			x = (responsePkt->fields.data[0] << 8) | responsePkt->fields.data[1];
+			evm_set_config_default(x);
+			sendPacket(responsePkt,HOST_OUT_HDR_SIZE + responsePkt->fields.hdr.length + HOST_CRC_SIZE);
+			break;
+		case HOST_CMD_SAVE_SETTINGS:
+			// validate length
+			if (responsePkt->fields.hdr.length != 0) {
+				sendErrorPacket(responsePkt,ERR_BAD_PACKET_SIZE);
+				break;
+			}
+			//Erase INFOC
+			do {
+					//Erase INFOC
+					Flash_SegmentErase((uint16_t*)INFOC_START);
+					x = Flash_EraseCheck((uint16_t*)INFOC_START,128/2);
+			} while (x == FLASH_STATUS_ERROR);
+
+			//Write calibration data to INFOC
+			FlashWrite_8(
+						 (uint8_t*)offsets,
+						 (uint8_t*)FlashOffsets,
+						 sizeof(uint16_t) * HOST_NUM_DEVICES*HOST_OFFSETS_SIZE
+						 );
+			if (!(calcCRC8((uint8_t *) &serial[0], HOST_SERIAL_LENGTH))) {
+				for (x = 0; x < HOST_SERIAL_LENGTH; x++) {
+					serial[x] ^= sharedSecret[x];
+				}
+				FlashWrite_8(
+							 (uint8_t*)serial,
+							 (uint8_t*)FlashSerial,
+							 HOST_SERIAL_LENGTH
+							 );
+			}
+			evm_save_defaults();
+			sendPacket(responsePkt,HOST_OUT_HDR_SIZE + responsePkt->fields.hdr.length + HOST_CRC_SIZE);
+			break;
+		default:
+			sendErrorPacket(responsePkt,ERR_INVALID_FUNCTION_CODE);
+			break;
+	}   // end switch
+}
+
+void processCmdPacket ()
+{
+static host_cmd_packet_t       commandPkt;
+static host_cmd_packet_t       responsePkt;
+static uint16_t x;
+
+	// Set up rcv operation for 1 byte of data to make sure it is a header
+	// If USBCDC_receiveData fails because of surprise removal
+	// or suspended by host abort and leave main loop
+	if (USBCDC_receiveData((BYTE*)&commandPkt.fields.hdr.id, 1, CDC0_INTFNUM) ==
+		kUSBCDC_busNotAvailable)
+	{
+		x = 1;
+		USBCDC_abortReceive(&x,CDC0_INTFNUM);
+		return;
+	}
+
+    // check namespace, if not the same, trigger ASCII menu
+    if (commandPkt.fields.hdr.id != HOST_ID) {
+    	// legacy
+    	if () {
+
+    	}
+    	else if (!executeMenuItem(commandPkt.fields.hdr.id)) {
+    		x = USBCDC_rejectData(CDC0_INTFNUM);
+    		// consume excess bytes in buffer
+    	}
+    	return;
+    }
+
+    // Set up rcv operation for rest of header data
+    // If USBCDC_receiveData fails because of surprise removal
+    // or suspended by host abort and leave main loop
+    if (USBCDC_receiveData((BYTE*)&commandPkt.fields.hdr.command_code ,HOST_IN_HDR_SIZE-1, CDC0_INTFNUM) ==
+        kUSBCDC_busNotAvailable)
+    {
+        x = HOST_IN_HDR_SIZE - 1;
+        USBCDC_abortReceive(&x,CDC0_INTFNUM);
+        return;
+    }
+
+    // validate header
+    // Validate packet length
+     if (commandPkt.fields.hdr.length > HOST_MAX_CMD_DATA_LEN) {
+         memcpy((uint8_t *)&responsePkt,(uint8_t *)&commandPkt, HOST_IN_HDR_SIZE);
+         sendErrorPacket(&responsePkt,ERR_BAD_PACKET_SIZE);
+         return;
+     }
+     // check device number out of range
+     else if (commandPkt.fields.hdr.device_num > 1) {
+         memcpy((uint8_t *)&responsePkt,(uint8_t *)&commandPkt, HOST_IN_HDR_SIZE);
+         sendErrorPacket(&responsePkt,ERR_INVALID_DEVICE);
+         return;
+     }
+     // check for host-side crc errors
+     else if (commandPkt.fields.hdr.err_code != (int8_t)ERR_OK) {
+         memcpy((uint8_t *)&responsePkt,(uint8_t *)&commandPkt, HOST_IN_HDR_SIZE);
+         sendErrorPacket(&responsePkt,ERR_PARAM_OUT_OF_RANGE);
+         return;
+     }
+
+    // Receive the rest of the data
+    if (USBCDC_receiveData((BYTE*)&commandPkt.fields.data[0],commandPkt.fields.hdr.length + HOST_CRC_SIZE, CDC0_INTFNUM) ==
+        kUSBCDC_busNotAvailable)
+    {
+        x = commandPkt.fields.hdr.length+HOST_CRC_SIZE;
+        USBCDC_abortReceive(&x,CDC0_INTFNUM);
+        return;
+    }
+
+    x = HOST_IN_HDR_SIZE + commandPkt.fields.hdr.length + HOST_CRC_SIZE;
+
+	// Valid packet will compute to a CRC of 0, when the CRC of the entire packet, including the CRC Bye is computed
+	if (calcCRC8((uint8_t *) &commandPkt, (uint8_t) x))
+	{
+		memcpy((uint8_t *)&responsePkt,(uint8_t *)&commandPkt, HOST_IN_HDR_SIZE);
+		sendErrorPacket(&responsePkt,ERR_COM_CRC_FAILED);
+        return;
+	}
+	// execute command
+	else
+	{
+		memcpy((uint8_t *)&responsePkt,(uint8_t *)&commandPkt, x);
+		executeCmdPacket(&responsePkt);
+		return;
+	}
+}
+
+void taskStreamExecute(scheduled_task_t * self) {
+	static uint8_t x, y;
+	static host_cmd_packet_t responsePkt;
+	if (packet_stream_type == NORMAL) {
+		x = getTaskIndexFromPID(self->pid);
+		if (x < HOST_INTERFACE_MAX_STREAM_TASKS) {
+			y = HOST_IN_HDR_SIZE + packet_tasks[x].packet.fields.hdr.length + HOST_CRC_SIZE;
+			memcpy((uint8_t *)&responsePkt,(uint8_t *)&packet_tasks[x].packet, y);
+			executeCmdPacket(&responsePkt);
+		}
+	}
+}
+
