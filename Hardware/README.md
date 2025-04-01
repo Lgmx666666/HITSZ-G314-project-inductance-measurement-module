@@ -24,7 +24,7 @@
 
 [https://www.iotword.com/9426.html](https://www.iotword.com/9426.html)
 
-![Gerber导出](imgaes/gerber-export.png)
+![Gerber导出](images/gerber-export.png)
 
 1. 制造输出-Gerber File： 单位-英寸，精度-2:4，使用到的制造层，包括未连接焊盘，不勾选钻孔层，高级-默认
 2. 制造输出-Gerber File： 单位-英寸，精度-2:4，不勾选制造层和包括未连接焊盘，勾选使用到的钻孔层，高级-默认
